@@ -1,0 +1,46 @@
+"""Public Python interface for assigning and coordinating A2A tasks."""
+
+from john.coordinator import John, Workspace
+from john.types import (
+    LIFECYCLE_EXT_URI,
+    WORKSPACE_EXT_URI,
+    AgentProfile,
+    ApprovalDecision,
+    ApprovalRequest,
+    AuthRequiredError,
+    BusyError,
+    Capabilities,
+    DuplicateMessageConflictError,
+    InvalidOutputError,
+    JohnError,
+    OutputSpec,
+    ResumeUnavailableError,
+    TransportError,
+    UnsupportedError,
+    WorkspaceGrant,
+    WorkspaceViolationError,
+    deny_all,
+)
+
+__all__ = [
+    "LIFECYCLE_EXT_URI",
+    "WORKSPACE_EXT_URI",
+    "AgentProfile",
+    "ApprovalDecision",
+    "ApprovalRequest",
+    "AuthRequiredError",
+    "BusyError",
+    "Capabilities",
+    "DuplicateMessageConflictError",
+    "InvalidOutputError",
+    "John",
+    "JohnError",
+    "OutputSpec",
+    "ResumeUnavailableError",
+    "TransportError",
+    "UnsupportedError",
+    "Workspace",
+    "WorkspaceGrant",
+    "WorkspaceViolationError",
+    "deny_all",
+]

@@ -1,0 +1,44 @@
+{
+  "contextId": "context-1",
+  "history": [
+    {
+      "contextId": "context-1",
+      "extensions": [
+        "https://john.dev/extensions/workspace/v1"
+      ],
+      "messageId": "invoice-request",
+      "metadata": {
+        "https://john.dev/extensions/workspace/v1": {
+          "access": "read_only",
+          "outputs": [],
+          "root": "invoice-fixture"
+        }
+      },
+      "parts": [
+        {
+          "mediaType": "text/plain",
+          "text": "Check the fixture invoices."
+        }
+      ],
+      "role": "ROLE_USER",
+      "taskId": "task-1"
+    }
+  ],
+  "id": "task-1",
+  "status": {
+    "message": {
+      "contextId": "context-1",
+      "messageId": "invoice-request-note",
+      "parts": [
+        {
+          "mediaType": "text/plain",
+          "text": "Which cutoff threshold should be applied?"
+        }
+      ],
+      "role": "ROLE_AGENT",
+      "taskId": "task-1"
+    },
+    "state": "TASK_STATE_INPUT_REQUIRED",
+    "timestamp": "2000-01-01T00:00:00Z"
+  }
+}

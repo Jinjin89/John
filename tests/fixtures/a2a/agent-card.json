@@ -1,0 +1,39 @@
+{
+  "capabilities": {
+    "extensions": [
+      {
+        "description": "Requires the read-only invoice-fixture workspace.",
+        "required": true,
+        "uri": "https://john.dev/extensions/workspace/v1"
+      }
+    ],
+    "streaming": true
+  },
+  "defaultInputModes": [
+    "text/plain"
+  ],
+  "defaultOutputModes": [
+    "application/json"
+  ],
+  "description": "Checks synthetic invoice scores against a user-supplied threshold.",
+  "name": "Invoice QC fixture",
+  "skills": [
+    {
+      "description": "Flags invoices at or above the cutoff score.",
+      "id": "invoice-qc",
+      "name": "Invoice quality control",
+      "tags": [
+        "invoice",
+        "qc"
+      ]
+    }
+  ],
+  "supportedInterfaces": [
+    {
+      "protocolBinding": "JSONRPC",
+      "protocolVersion": "1.0",
+      "url": "https://invoice-qc.example.invalid/"
+    }
+  ],
+  "version": "0.1.0"
+}

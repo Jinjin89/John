@@ -1,0 +1,17 @@
+# John project ignore rules
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+*.db
+*.db-shm
+*.db-wal
+.review/
+.agents/
+spikes/
+scripts/agy_monitor.py
