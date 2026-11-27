@@ -7,6 +7,7 @@ import json
 import socket
 import sqlite3
 import sys
+import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, closing
 from pathlib import Path
@@ -983,7 +984,10 @@ def test_cli_run_reads_stdin_and_separates_text_progress(
 
 
 def test_cli_run_emits_ndjson_events_and_final_task(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     async def write(session: FixtureSession, request: TurnRequest) -> TurnOutcome:
         assert session.path is not None
@@ -991,21 +995,28 @@ def test_cli_run_emits_ndjson_events_and_final_task(
         return finish(request)
 
     install_fixture_driver(monkeypatch, write)
-    assert (
-        main(
-            [
-                *cli_args(tmp_path),
-                "--json",
-                "--workspace",
-                "sample:read_write",
-                "--output",
-                "result:result.txt:text/plain",
-                "write the file",
-            ]
+    caplog.set_level("WARNING", logger="a2a.server.request_handlers.default_request_handler_v2")
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.simplefilter("always")
+        assert (
+            main(
+                [
+                    *cli_args(tmp_path),
+                    "--json",
+                    "--workspace",
+                    "sample:read_write",
+                    "--output",
+                    "result:result.txt:text/plain",
+                    "write the file",
+                ]
+            )
+            == 0
         )
-        == 0
-    )
-    records = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert not any("cross-replica streaming is disabled" in str(item.message) for item in recorded)
+    assert "cross-replica streaming is disabled" not in caplog.text
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    records = [json.loads(line) for line in captured.out.splitlines()]
     assert any(event.get("kind") == "started" for event in records[:-1])
     task = records[-1]
     assert task["status"]["state"] == "TASK_STATE_COMPLETED"

@@ -33,6 +33,7 @@ _MAX_LINE_BYTES = 16 * 1024 * 1024
 _MAX_QUEUE_FRAMES = 1024
 _MAX_QUEUE_BYTES = 32 * 1024 * 1024
 _READ_BYTES = 64 * 1024
+_KILL_DRAIN_S = 2.0
 _REDACTED = "<redacted>"
 _SECRET_ASSIGNMENT = re.compile(
     r"""(?ix)
@@ -548,14 +549,25 @@ class StdioTransport:
             os.killpg(self.pid, sig)
         except ProcessLookupError:
             return False
+        except PermissionError:
+            # On macOS (XNU), killpg raises EPERM instead of ESRCH when only
+            # zombies or unsignallable processes remain in the process group.
+            if not self._exit_task.done():
+                with suppress(ProcessLookupError, PermissionError):
+                    os.kill(self.pid, sig)
+                    return True
+            return False
         return True
+
+    async def _drain_group(self) -> None:
+        # On other POSIX systems the system reaper collects adopted descendants.
+        while self._signal_group(0):
+            await asyncio.sleep(0.01)
 
     async def _wait_for_group(self) -> int:
         code = await asyncio.shield(self._exit_task)
         if self._status is None:
-            # On other POSIX systems the system reaper collects adopted descendants.
-            while self._signal_group(0):
-                await asyncio.sleep(0.01)
+            await self._drain_group()
         return code
 
     async def _reap(self, grace_s: float, term_s: float) -> int:
@@ -567,7 +579,14 @@ class StdioTransport:
             except TimeoutError:
                 if not self._exit_task.done() or self._status is None:
                     self._signal_group(sig)
-        return await self._wait_for_group()
+        code = await asyncio.shield(self._exit_task)
+        if self._status is None:
+            try:
+                async with asyncio.timeout(max(term_s, _KILL_DRAIN_S)):
+                    await self._drain_group()
+            except TimeoutError:
+                _LOG.warning("Process group %s still active after SIGKILL", self.pid)
+        return code
 
     async def _complete_close(self, reaping: asyncio.Task[int], drain_s: float) -> int:
         try:

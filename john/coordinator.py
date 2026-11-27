@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import tomllib
+import warnings
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Mapping, Sequence
 from contextlib import AsyncExitStack, aclosing, asynccontextmanager
@@ -329,6 +331,15 @@ class _Admission:
     events: asyncio.Queue[Event | None] | None = None
 
 
+_A2A_HANDLER_LOGGER = "a2a.server.request_handlers.default_request_handler_v2"
+_CROSS_REPLICA_WARNING = "cross-replica streaming is disabled"
+
+
+class _SuppressCrossReplicaWarning(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return _CROSS_REPLICA_WARNING not in record.getMessage()
+
+
 class _ReservedRequestHandler(DefaultRequestHandler):
     """Admit both forms of SendMessage before delegating to the SDK handler."""
 
@@ -338,12 +349,24 @@ class _ReservedRequestHandler(DefaultRequestHandler):
         self._name = card.name
         self._streaming = card.capabilities.streaming
         self._store = ledger.task_store_for(self._name)
-        super().__init__(
-            agent_executor=executor,
-            task_store=self._store,
-            agent_card=card,
-            request_context_builder=_ReservedTaskContextBuilder(),
-        )
+        # John owns an exclusive single-process SQLite ledger; cross-replica streaming does not
+        # apply.
+        handler_logger = logging.getLogger(_A2A_HANDLER_LOGGER)
+        warning_filter = _SuppressCrossReplicaWarning()
+        handler_logger.addFilter(warning_filter)
+        try:
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore", message=f".*{_CROSS_REPLICA_WARNING}.*", category=UserWarning
+                )
+                super().__init__(
+                    agent_executor=executor,
+                    task_store=self._store,
+                    agent_card=card,
+                    request_context_builder=_ReservedTaskContextBuilder(),
+                )
+        finally:
+            handler_logger.removeFilter(warning_filter)
         self._admission_lock = asyncio.Lock()
         self._reservations: set[asyncio.Task[_Admission]] = set()
         self._pending: dict[tuple[str, str], asyncio.Task[Task]] = {}

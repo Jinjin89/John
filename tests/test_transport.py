@@ -627,3 +627,65 @@ async def test_close_reaps_group_even_when_only_grandchild_is_left(
                 os.kill(pid, 0)
         with pytest.raises(ProcessLookupError):
             os.killpg(transport.pid, 0)
+
+
+@pytest.mark.parametrize("after_exit", [True, False])
+async def test_close_handles_eperm_from_killpg_on_non_linux_posix(
+    after_exit: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
+    frames: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    source = (
+        "print('{\"ready\":true}', flush=True)"
+        if after_exit
+        else "import signal\nprint('{\"ready\":true}', flush=True)\nsignal.pause()"
+    )
+    transport = await StdioTransport.start(child(source), on_frame=frames.put)
+    real_killpg = os.killpg
+    killpg_calls: list[int] = []
+
+    def eperm_killpg(pgid: int, sig: int) -> None:
+        if pgid == transport.pid:
+            killpg_calls.append(sig)
+            raise PermissionError(1, "Operation not permitted")
+        real_killpg(pgid, sig)
+
+    monkeypatch.setattr(os, "killpg", eperm_killpg)
+    caplog.set_level("ERROR", logger="john.transport")
+    async with asyncio.timeout(5):
+        assert await frames.get() == {"ready": True}
+        code = await transport.close(grace_s=0.05, term_s=0.1)
+    assert code == (0 if after_exit else -signal.SIGTERM)
+    assert killpg_calls
+    assert "Process cleanup failed" not in caplog.text
+
+
+async def test_close_bounds_non_linux_group_drain_after_sigkill(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr("john.transport._KILL_DRAIN_S", 0.05)
+    frames: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    transport = await StdioTransport.start(
+        child("print('{\"ready\":true}', flush=True)"),
+        on_frame=frames.put,
+    )
+    real_killpg = os.killpg
+    signals_seen: list[int] = []
+
+    def lingering_group(pgid: int, sig: int) -> None:
+        if pgid == transport.pid:
+            signals_seen.append(sig)
+            return
+        real_killpg(pgid, sig)
+
+    monkeypatch.setattr(os, "killpg", lingering_group)
+    caplog.set_level("WARNING", logger="john.transport")
+    async with asyncio.timeout(2):
+        assert await frames.get() == {"ready": True}
+        assert await transport.close(grace_s=0.02, term_s=0.02) == 0
+    assert signal.SIGTERM in signals_seen and signal.SIGKILL in signals_seen
+    assert "still active after SIGKILL" in caplog.text
