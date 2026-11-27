@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -22,6 +21,7 @@ from john.drivers._common import (
     _string,
     _Turn,
     _turn_prompt,
+    build_child_env,
 )
 from john.transport import (
     Frame,
@@ -439,7 +439,7 @@ class AcpDriver:
         session._peer = await _OrderedAcpPeer.start(
             (profile.command, *profile.args),
             cwd=workspace_path,
-            env={**os.environ, **profile.env},
+            env=build_child_env(profile),
             include_jsonrpc=True,
             on_notification=session._notification,
             on_request=session._permission,

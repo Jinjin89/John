@@ -177,6 +177,8 @@ class AgentProfile(BaseModel):
     command: str | None = None
     args: tuple[str, ...] = ()
     env: dict[str, str] = Field(default_factory=dict)
+    unset_env: tuple[str, ...] = ()
+    fallback_agents: tuple[str, ...] = ()
     url: str | None = None
     default_access: WorkspaceAccess = "read_only"
     require_workspace: bool = False

@@ -1,9 +1,12 @@
 import asyncio
 import copy
 import json
+import os
+import pwd
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -161,7 +164,8 @@ def mock_server(
     resume: bool = False,
     options: dict[str, Any] | None = None,
     env: dict[str, str] | None = None,
-    expected_env: dict[str, str] | None = None,
+    unset_env: tuple[str, ...] = (),
+    expected_env: dict[str, str | None] | None = None,
     profile_dir: Path | None = None,
     exit_after_steps: bool = False,
 ) -> Mock:
@@ -191,6 +195,7 @@ def mock_server(
         options=options or {},
         profile_dir=profile_dir,
         env=env or {},
+        unset_env=unset_env,
     )
     return Mock(profile, marker, log)
 
@@ -484,6 +489,31 @@ async def test_workspace_write_prompt_schema_and_child_environment(
     assert '"report": "out/report.json" (application/json)' in params["input"][0]["text"]
 
 
+@pytest.mark.parametrize("override", [False, True])
+async def test_codex_removes_configured_environment_variables_before_launch(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch, override: bool
+) -> None:
+    inherited = str(workspace / "inherited-state")
+    configured = str(workspace.parent / "configured-state")
+    monkeypatch.setenv("CODEX_HOME", inherited)
+    monkeypatch.setenv("OPENAI_API_KEY", "parent-fixture")
+    monkeypatch.setenv("HOME", str(workspace.parent / "home"))
+    mock = mock_server(
+        workspace,
+        [*initialize(), *thread_setup(workspace)],
+        unset_env=("CODEX_HOME", "OPENAI_API_KEY"),
+        env={"CODEX_HOME": configured} if override else None,
+        expected_env={"CODEX_HOME": configured if override else None, "OPENAI_API_KEY": None},
+    )
+    async with CodexAppServerDriver().open(
+        mock.profile, workspace_path=workspace, access="read_only"
+    ) as session:
+        assert session.native_ref == _THREAD
+    mock.frames()
+    assert os.environ["CODEX_HOME"] == inherited
+    assert os.environ["OPENAI_API_KEY"] == "parent-fixture"
+
+
 async def test_workspace_write_rejects_extra_writable_roots(workspace: Path) -> None:
     sandbox = {
         "type": "workspaceWrite",
@@ -548,18 +578,29 @@ async def test_rejects_effective_codex_home_from_environment(
             pytest.fail("Opened an overlapping state directory")
 
 
-@pytest.mark.parametrize("override_home", [False, True])
+@pytest.mark.parametrize("source", ["default", "empty-override", "unset", "unset-home"])
 async def test_rejects_codex_home_fallback_inside_workspace(
-    workspace: Path, monkeypatch: pytest.MonkeyPatch, override_home: bool
+    workspace: Path, monkeypatch: pytest.MonkeyPatch, source: str
 ) -> None:
     env = {}
-    if override_home:
-        monkeypatch.setenv("CODEX_HOME", str(workspace.parent / "separate-state"))
-        env = {"CODEX_HOME": "", "HOME": str(workspace)}
-    else:
+    unset_env = ()
+    if source == "default":
         monkeypatch.delenv("CODEX_HOME", raising=False)
         monkeypatch.setenv("HOME", str(workspace))
-    profile = AgentProfile(name="example", kind="codex", command="missing-executable", env=env)
+    else:
+        monkeypatch.setenv("CODEX_HOME", str(workspace.parent / "separate-state"))
+        if source == "empty-override":
+            env = {"CODEX_HOME": "", "HOME": str(workspace)}
+        elif source == "unset":
+            unset_env = ("CODEX_HOME",)
+            monkeypatch.setenv("HOME", str(workspace))
+        else:
+            unset_env = ("CODEX_HOME", "HOME")
+            monkeypatch.setenv("HOME", str(workspace.parent))
+            monkeypatch.setattr(pwd, "getpwuid", lambda _: SimpleNamespace(pw_dir=str(workspace)))
+    profile = AgentProfile(
+        name="example", kind="codex", command="missing-executable", env=env, unset_env=unset_env
+    )
     with pytest.raises(WorkspaceViolationError, match="separate from the workspace"):
         async with CodexAppServerDriver().open(
             profile, workspace_path=workspace, access="read_only"
@@ -663,6 +704,30 @@ async def test_resume_unavailable_before_launch_and_on_rpc_error(workspace: Path
             mock.profile, workspace_path=workspace, access="read_only", resume_ref=_THREAD
         ):
             pytest.fail("Opened a missing persisted thread")
+    mock.frames()
+
+
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [(401, "Request rejected"), (-32000, "Login required"), (-32000, "Access token has expired")],
+)
+async def test_codex_resume_preserves_authentication_failures(
+    workspace: Path, code: int, message: str
+) -> None:
+    mock = mock_server(
+        workspace,
+        [
+            *initialize(),
+            expect("thread/resume", "thread"),
+            {"send": {"error": {"code": code, "message": message}}, "reply_to": "thread"},
+        ],
+        resume=True,
+    )
+    with pytest.raises(AuthRequiredError, match="authentication is required"):
+        async with CodexAppServerDriver().open(
+            mock.profile, workspace_path=workspace, access="read_only", resume_ref=_THREAD
+        ):
+            pytest.fail("Opened a thread without authentication")
     mock.frames()
 
 
@@ -916,6 +981,45 @@ async def test_authentication_error_and_opt_in_raw_redaction(workspace: Path) ->
     (extra,) = [event for event in events if isinstance(event, OtherEvent)]
     assert extra.redacted and extra.raw["data"] == {"apiKey": "<redacted>", "safe": "hello"}
     assert "fixture-secret" not in str(events)
+    mock.frames()
+
+
+@pytest.mark.parametrize("source", ["notification", "terminal"])
+async def test_codex_uses_the_latest_error_after_a_retryable_401(
+    workspace: Path, source: str
+) -> None:
+    params = {"threadId": _THREAD, "turnId": _TURN}
+    retryable_error = {
+        "message": "Unauthorized. Authentication failed.",
+        "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 401}},
+    }
+    final_error = {"message": "The prompt is too long", "codexErrorInfo": "contextWindowExceeded"}
+    terminal = turn(_TURN, "failed")
+    steps = [
+        *initialize(),
+        *thread_setup(workspace),
+        expect("turn/start", "run"),
+        reply("run", {"turn": turn()}),
+        notify("error", **params, error=retryable_error, willRetry=True),
+    ]
+    if source == "notification":
+        steps.append(notify("error", **params, error=final_error, willRetry=False))
+    else:
+        terminal["error"] = final_error
+    steps.append(notify("turn/completed", threadId=_THREAD, turn=terminal))
+    mock = mock_server(workspace, steps)
+    events = Events()
+    async with CodexAppServerDriver().open(
+        mock.profile, workspace_path=workspace, access="read_only"
+    ) as session:
+        result = await session.run_turn(
+            TurnRequest(run_id="retry", prompt="Reply"), events, deny_all
+        )
+    assert (result.result.status, result.result.reason) == ("failed", "contextWindowExceeded")
+    assert [(event.code, event.retryable) for event in events if isinstance(event, ErrorEvent)] == [
+        ("auth_required", True),
+        ("contextWindowExceeded", False),
+    ]
     mock.frames()
 
 

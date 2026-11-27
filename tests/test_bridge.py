@@ -37,12 +37,14 @@ from john.types import (
     ApprovalDecision,
     ApprovalPolicy,
     ApprovalRequest,
+    AuthRequiredError,
     Capabilities,
     EventSink,
     FinishedEvent,
     OutputSpec,
     SkillSpec,
     StartedEvent,
+    ToolEvent,
     TurnFinished,
     TurnNeedsInput,
     TurnOutcome,
@@ -68,10 +70,17 @@ class FixtureDriver:
     native_ref = "native-ref"
     ignored_fields: dict[str, str] = {}
 
-    def __init__(self, program: Program, capabilities: Capabilities | None = None):
+    def __init__(
+        self,
+        program: Program,
+        capabilities: Capabilities | None = None,
+        *,
+        open_error: Exception | None = None,
+    ):
         self.program = program
         self.capabilities = capabilities or Capabilities()
         self.opened: list[tuple[Path | None, WorkspaceAccess, str | None]] = []
+        self.open_error = open_error
         self.requests: list[TurnRequest] = []
         self.cancel_calls: list[str] = []
         self.cancellation = asyncio.Event()
@@ -86,6 +95,8 @@ class FixtureDriver:
         resume_ref: str | None = None,
     ) -> AsyncIterator[FixtureDriver]:
         self.opened.append((workspace_path, access, resume_ref))
+        if self.open_error is not None:
+            raise self.open_error
         yield self
 
     async def run_turn(
@@ -158,6 +169,7 @@ async def handler_for(
     registry: WorkspaceRegistry | None = None,
     *,
     cancel_timeout_s: float = 0.05,
+    fallbacks: tuple[tuple[AgentProfile, FixtureDriver], ...] = (),
 ) -> AsyncIterator[DefaultRequestHandler]:
     executor = JohnAgentExecutor(
         spec,
@@ -167,6 +179,7 @@ async def handler_for(
         SessionRuntime(ledger),
         owner_resolver=owner,
         cancel_timeout_s=cancel_timeout_s,
+        fallbacks=fallbacks,
     )
     with pytest.warns(UserWarning, match="cross-replica streaming is disabled"):
         handler = DefaultRequestHandler(
@@ -190,6 +203,13 @@ async def submit(
 
 async def completed(request: TurnRequest, emit: EventSink, approve: ApprovalPolicy) -> TurnOutcome:
     return TurnFinished(result=TurnResult(run_id=request.run_id, status="completed", text="ok"))
+
+
+async def auth_rejected(turn: TurnRequest, emit: EventSink, approve: ApprovalPolicy) -> TurnOutcome:
+    await emit(StartedEvent(run_id=turn.run_id, seq=0))
+    return TurnFinished(
+        result=TurnResult(run_id=turn.run_id, status="failed", reason="auth_required")
+    )
 
 
 def registry_for(path: Path, *, principal: str = "local") -> WorkspaceRegistry:
@@ -339,6 +359,208 @@ async def test_missing_required_extension_is_an_a2a_error(ledger: SqliteLedger) 
         with pytest.raises(ExtensionSupportRequiredError, match="required workspace extension"):
             await submit(handler, request(), context())
     assert driver.opened == [] and await ledger.list_runs() == []
+
+
+@pytest.mark.parametrize("fails_in_open", [True, False])
+async def test_auth_required_is_structured_for_setup_and_terminal_failures(
+    ledger: SqliteLedger, fails_in_open: bool
+) -> None:
+    error = AuthRequiredError("Private native error details") if fails_in_open else None
+    driver = FixtureDriver(auth_rejected, open_error=error)
+    async with handler_for(ledger, profile(), driver) as handler:
+        task = await submit(handler, request(), context())
+        assert task.status.state == FAILED
+        assert task.status.message.parts[0].text == "auth_required"
+        assert MessageToDict(task.metadata) == {LIFECYCLE_EXT_URI: {"auth_required": True}}
+        assert await handler.on_get_task(GetTaskRequest(id=task.id), context()) == task
+    assert len(driver.requests) == (0 if fails_in_open else 1)
+
+
+async def test_fallback_links_pre_effect_auth_failure_and_uses_remaining_deadline(
+    ledger: SqliteLedger,
+) -> None:
+    primary = FixtureDriver(auth_rejected)
+    fallback = FixtureDriver(completed)
+    alternate = AgentProfile(name="backup", kind="test")
+    async with handler_for(
+        ledger, profile(), primary, fallbacks=((alternate, fallback),)
+    ) as handler:
+        task = await submit(handler, request(), context(john_timeout_s=3.0))
+        assert task.status.state == COMPLETED and task.artifacts[0].parts[0].text == "ok"
+        assert MessageToDict(task.metadata) == {
+            LIFECYCLE_EXT_URI: {"fallback_from": "review", "resolved_agent": "backup"}
+        }
+        failed, resolved = await ledger.list_runs(task_id=task.id)
+        assert (failed["status"], failed["reason"]) == ("failed", "auth_required")
+        assert resolved["status"] == "completed" and resolved["parent_run_id"] == failed["run_id"]
+        assert {failed["agent_name"], resolved["agent_name"]} == {"review"}
+        assert {failed["context_id"], resolved["context_id"]} == {task.context_id}
+        events = await ledger.get_run_events(failed["run_id"])
+        assert [event.kind for event in events] == ["started", "finished"]
+        assert events[-1].reason == "auth_required"
+    assert 0 < fallback.requests[0].timeout_s < primary.requests[0].timeout_s <= 3.0
+
+
+@pytest.mark.parametrize("stop_reason", ["tool", "output", "other_failure", "indeterminate"])
+async def test_effectful_auth_and_other_failures_stop_the_fallback_chain(
+    ledger: SqliteLedger, tmp_path: Path, stop_reason: str
+) -> None:
+    caps = Capabilities(enforced_sandbox=frozenset({"read_write"}))
+    alternate = AgentProfile(name="backup", kind="test", capabilities=caps)
+    fallback = FixtureDriver(completed, caps)
+    registry = WorkspaceRegistry()
+    registry.register(
+        WorkspaceGrant(
+            root_id="shared",
+            host_path=tmp_path,
+            max_access="read_write",
+            allowed_agents=frozenset({"review", "backup"}),
+        )
+    )
+
+    async def fail(turn: TurnRequest, emit: EventSink, approve: ApprovalPolicy) -> TurnOutcome:
+        if stop_reason == "tool":
+            await emit(
+                ToolEvent(run_id=turn.run_id, seq=0, call_id="read", name="read", phase="started")
+            )
+        if stop_reason == "output":
+            (tmp_path / "report.txt").write_text("written", encoding="utf-8")
+        return TurnFinished(
+            result=TurnResult(
+                run_id=turn.run_id,
+                status="indeterminate" if stop_reason == "indeterminate" else "failed",
+                reason="auth_required" if stop_reason in ("tool", "output") else "native_failure",
+            )
+        )
+
+    primary = FixtureDriver(fail, caps)
+    workspace = {
+        "root": "shared",
+        "access": "read_write",
+        "outputs": [
+            {"name": "report", "path": "report.txt"},
+        ],
+    }
+    async with handler_for(
+        ledger, profile(capabilities=caps), primary, registry, fallbacks=((alternate, fallback),)
+    ) as handler:
+        task = await submit(handler, request(workspace=workspace), context(workspace=True))
+        assert task.status.state == FAILED and not task.artifacts
+        assert not fallback.opened
+        (run,) = await ledger.list_runs(task_id=task.id)
+        if stop_reason in ("tool", "output"):
+            assert run["reason"] == "auth_required"
+            assert MessageToDict(task.metadata) == {LIFECYCLE_EXT_URI: {"auth_required": True}}
+        elif stop_reason == "indeterminate":
+            assert MessageToDict(task.metadata) == {LIFECYCLE_EXT_URI: {"indeterminate": True}}
+        else:
+            assert not task.metadata.fields
+
+
+async def test_fallback_skips_profiles_and_sessions_without_workspace_authorization(
+    ledger: SqliteLedger, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="john.bridge")
+    caps = Capabilities(enforced_sandbox=frozenset({"read_only"}))
+    registry = WorkspaceRegistry()
+    registry.register(
+        WorkspaceGrant(
+            root_id="shared",
+            host_path=tmp_path,
+            allowed_agents=frozenset({"review", "unconfigured", "unsafe-session", "ready"}),
+        )
+    )
+    primary = FixtureDriver(auth_rejected, caps)
+    denied = FixtureDriver(completed, caps)
+    unconfigured = FixtureDriver(completed)
+    unsafe = FixtureDriver(completed)
+    ready = FixtureDriver(completed, caps)
+    fallbacks = (
+        (AgentProfile(name="denied", kind="test", capabilities=caps), denied),
+        (AgentProfile(name="unconfigured", kind="test"), unconfigured),
+        (AgentProfile(name="unsafe-session", kind="test", capabilities=caps), unsafe),
+        (AgentProfile(name="ready", kind="test", capabilities=caps), ready),
+    )
+    async with handler_for(
+        ledger, profile(capabilities=caps), primary, registry, fallbacks=fallbacks
+    ) as handler:
+        task = await submit(handler, request(workspace={"root": "shared"}), context(workspace=True))
+        assert task.status.state == COMPLETED
+        assert MessageToDict(task.metadata)[LIFECYCLE_EXT_URI]["resolved_agent"] == "ready"
+        assert len(await ledger.list_runs(task_id=task.id)) == 2
+    assert not denied.opened and not unconfigured.opened
+    assert unsafe.opened == [(tmp_path, "read_only", None)] and not unsafe.requests
+    assert ready.opened == [(tmp_path, "read_only", None)]
+    assert "Skipped fallback agent denied (Agent is unauthorized" in caplog.text
+    assert "Skipped fallback agent unconfigured (Driver lacks sandbox enforcement" in caplog.text
+    assert "Skipped fallback agent unsafe-session (Session cannot enforce" in caplog.text
+
+
+async def test_exhausted_auth_fallbacks_publish_all_attempted_agents(ledger: SqliteLedger) -> None:
+    primary = FixtureDriver(completed, open_error=AuthRequiredError("credential details"))
+    alternate = AgentProfile(name="backup", kind="test")
+    fallback = FixtureDriver(auth_rejected)
+    async with handler_for(
+        ledger, profile(), primary, fallbacks=((alternate, fallback),)
+    ) as handler:
+        task = await submit(handler, request(), context())
+        assert task.status.state == FAILED and task.status.message.parts[0].text == "auth_required"
+        lifecycle = MessageToDict(task.metadata)[LIFECYCLE_EXT_URI]
+        assert lifecycle["auth_required"] is True
+        assert lifecycle["attempted_agents"] == ["review", "backup"]
+        first, second = await ledger.list_runs(task_id=task.id)
+        assert [run["reason"] for run in (first, second)] == ["auth_required", "auth_required"]
+        assert second["parent_run_id"] == first["run_id"]
+        (setup_event,) = await ledger.get_run_events(first["run_id"])
+        assert setup_event.kind == "finished" and setup_event.status == "failed"
+    assert not primary.requests and len(fallback.requests) == 1
+
+
+async def test_timeout_during_setup_stops_without_opening_fallback(ledger: SqliteLedger) -> None:
+    class WaitingDriver(FixtureDriver):
+        @asynccontextmanager
+        async def open(self, *args, **kwargs):
+            await asyncio.Future()
+            yield self
+
+    primary = WaitingDriver(completed)
+    alternate = AgentProfile(name="backup", kind="test")
+    fallback = FixtureDriver(completed)
+    async with handler_for(
+        ledger, profile(), primary, fallbacks=((alternate, fallback),)
+    ) as handler:
+        task = await submit(handler, request(), context(john_timeout_s=0.05))
+    assert task.status.state == FAILED and task.status.message.parts[0].text == "turn_timeout"
+    assert not primary.requests and not fallback.opened and await ledger.list_runs() == []
+
+
+async def test_cancel_targets_the_active_fallback_attempt(ledger: SqliteLedger) -> None:
+    started = asyncio.Event()
+
+    async def held(turn: TurnRequest, emit: EventSink, approve: ApprovalPolicy) -> TurnOutcome:
+        started.set()
+        await fallback.cancellation.wait()
+        return TurnFinished(result=TurnResult(run_id=turn.run_id, status="cancelled"))
+
+    primary = FixtureDriver(auth_rejected)
+    fallback = FixtureDriver(held)
+    spare = FixtureDriver(completed)
+    fallbacks = (
+        (AgentProfile(name="backup", kind="test"), fallback),
+        (AgentProfile(name="spare", kind="test"), spare),
+    )
+    call = context()
+    async with handler_for(ledger, profile(), primary, fallbacks=fallbacks) as handler:
+        task = await submit(handler, request(immediate=True), call)
+        async with asyncio.timeout(5):
+            await started.wait()
+            cancelled = await handler.on_cancel_task(CancelTaskRequest(id=task.id), call)
+        assert cancelled is not None and cancelled.status.state == CANCELED
+        assert await handler.on_get_task(GetTaskRequest(id=task.id), call) == cancelled
+        original, active = await ledger.list_runs(task_id=task.id)
+        assert (original["status"], active["status"]) == ("failed", "cancelled")
+    assert fallback.cancel_calls == [active["run_id"]]
+    assert not primary.cancel_calls and not spare.opened
 
 
 @pytest.mark.parametrize(
@@ -566,19 +788,14 @@ async def test_publish_queue_failure_records_indeterminate_outcome(
     caps = Capabilities(task_questions=True)
     driver = FixtureDriver(program, caps)
     async with handler_for(ledger, profile(capabilities=caps), driver) as handler:
-        if closed:
-            try:
-                returned = await submit(handler, request(), context())
-            except InternalError as exc:
-                assert "publication" in str(exc)
-            else:
-                assert returned.status.state == FAILED and not returned.artifacts
-                assert MessageToDict(returned.metadata) == {
-                    LIFECYCLE_EXT_URI: {"indeterminate": True}
-                }
+        expected_error = InternalError if closed else RuntimeError
+        try:
+            returned = await submit(handler, request(), context())
+        except expected_error as exc:
+            assert "publication" in str(exc)
         else:
-            with pytest.raises(RuntimeError, match="publication"):
-                await submit(handler, request(), context())
+            assert returned.status.state == FAILED and not returned.artifacts
+            assert MessageToDict(returned.metadata) == {LIFECYCLE_EXT_URI: {"indeterminate": True}}
         (run,) = await ledger.list_runs()
         saved = await handler.on_get_task(GetTaskRequest(id=run["task_id"]), context())
         assert saved is not None and saved.status.state == FAILED and not saved.artifacts

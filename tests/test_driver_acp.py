@@ -52,6 +52,10 @@ for line in open(sys.argv[1], encoding='utf-8'):
 _MOCK = """
 import json, os, sys, time
 mode = sys.argv[1]
+if mode == 'child_env':
+    assert 'OPENAI_API_KEY' not in os.environ
+    assert os.environ['JOHN_ACP_TEST_ENV'] == 'launch'
+    assert os.environ['JOHN_ACP_TEST_INHERITED'] == 'inherited'
 
 def send(**fields):
     print(json.dumps({'jsonrpc': '2.0', **fields}), flush=True)
@@ -106,7 +110,7 @@ if mode in ('load', 'resume'):
     send(id=setup['id'], result={})
 else:
     send(id=setup['id'], result={'sessionId': 'session'})
-if mode == 'idle':
+if mode in ('idle', 'child_env'):
     assert not sys.stdin.read()
     sys.exit(0)
 
@@ -176,6 +180,21 @@ def _sink(records: list[RuntimeEvent]):
         records.append(event)
 
     return emit
+
+
+async def test_acp_removes_configured_environment_variables_before_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "parent-fixture")
+    monkeypatch.setenv("JOHN_ACP_TEST_ENV", "parent")
+    monkeypatch.setenv("JOHN_ACP_TEST_INHERITED", "inherited")
+    profile = _profile(_MOCK, "child_env").model_copy(
+        update={"unset_env": ("OPENAI_API_KEY", "JOHN_ACP_TEST_ENV", "JOHN_ACP_TEST_ABSENT")}
+    )
+    async with AcpDriver().open(profile, workspace_path=tmp_path, access="read_only") as session:
+        assert session.native_ref == "session"
+    assert os.environ["OPENAI_API_KEY"] == "parent-fixture"
+    assert os.environ["JOHN_ACP_TEST_ENV"] == "parent"
 
 
 @pytest.mark.parametrize("fixture", ["agy.jsonl", "mock.jsonl"])

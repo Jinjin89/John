@@ -83,6 +83,7 @@ _DEFAULT_SERVE_URL = "http://127.0.0.1:8080/a2a"
 _MAX_STREAM_EVENTS = 256
 _MAX_DIRECT_RESPONSES = 256
 _DIRECT_RESPONSE_PREFIX = "john:direct-message:"
+_MAX_FALLBACK_DEPTH = 5
 
 type Parent = tuple[str, str] | str
 
@@ -186,6 +187,42 @@ def _read_config(config_path: Path) -> tuple[list[AgentProfile], WorkspaceRegist
     except (AttributeError, KeyError, TypeError, ValueError):
         raise ValueError("Invalid ledger, workspace, or agent configuration") from None
     return profiles, workspaces, db_path
+
+
+def _fallback_orders(profiles: Mapping[str, AgentProfile]) -> dict[str, tuple[str, ...]]:
+    resolved: dict[str, tuple[tuple[str, ...], int]] = {}
+    visiting: set[str] = set()
+
+    def visit(profile: AgentProfile) -> tuple[tuple[str, ...], int]:
+        name = profile.name
+        if name in visiting:
+            raise ValueError(f"Fallback agent cycle involving {name!r}")
+        if name in resolved:
+            return resolved[name]
+        if len(visiting) > _MAX_FALLBACK_DEPTH:
+            raise ValueError(f"Fallback chains may have at most {_MAX_FALLBACK_DEPTH} levels")
+        if profile.kind == "remote" and profile.fallback_agents:
+            raise UnsupportedError("Only local profiles can configure fallback agents")
+
+        visiting.add(name)
+        ordered: dict[str, None] = {}
+        depth = 0
+        for target in profile.fallback_agents:
+            if target not in profiles:
+                raise ValueError(f"Unknown fallback agent {target!r} for {name!r}")
+            if profiles[target].kind == "remote":
+                raise UnsupportedError("Fallback agents must be local profiles")
+            descendants, distance = visit(profiles[target])
+            depth = max(depth, distance + 1)
+            if depth > _MAX_FALLBACK_DEPTH:
+                raise ValueError(f"Fallback chains may have at most {_MAX_FALLBACK_DEPTH} levels")
+            ordered[target] = None
+            ordered.update(dict.fromkeys(descendants))
+        visiting.remove(name)
+        result = resolved[name] = (tuple(ordered), depth)
+        return result
+
+    return {name: visit(profile)[0] for name, profile in profiles.items()}
 
 
 def _fingerprint(
@@ -501,6 +538,7 @@ class John:
             if profile.name in self._profiles:
                 raise ValueError(f"Duplicate agent profile {profile.name!r}")
             self._profiles[profile.name] = profile
+        fallback_orders = _fallback_orders(self._profiles)
         if isinstance(workspaces, WorkspaceRegistry):
             self._workspaces = workspaces
         else:
@@ -518,6 +556,7 @@ class John:
         self._lifecycle_lock = asyncio.Lock()
         self._started = self._closed = False
 
+        local_drivers: dict[str, Driver] = {}
         for profile in self._profiles.values():
             if profile.kind == "remote":
                 if not profile.url:
@@ -528,10 +567,19 @@ class John:
                 raise UnsupportedError(
                     f"No driver registered for agent {profile.name!r}. Supply an explicit registry."
                 )
-            card = self._cards[profile.name] = build_agent_card(profile)
-            self._handlers[profile.name] = _ReservedRequestHandler(
+            local_drivers[profile.name] = driver
+
+        for name, driver in local_drivers.items():
+            profile = self._profiles[name]
+            fallbacks = tuple(
+                (self._profiles[target], local_drivers[target]) for target in fallback_orders[name]
+            )
+            card = self._cards[name] = build_agent_card(profile)
+            self._handlers[name] = _ReservedRequestHandler(
                 ledger,
-                JohnAgentExecutor(profile, driver, ledger, self._workspaces, self._runtime),
+                JohnAgentExecutor(
+                    profile, driver, ledger, self._workspaces, self._runtime, fallbacks=fallbacks
+                ),
                 card,
             )
 

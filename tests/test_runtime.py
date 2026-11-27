@@ -413,14 +413,16 @@ async def test_runtime_rejects_overlap_and_returns_confirmed_cancel(
 
 
 async def test_runtime_deadline_invokes_native_cancel_and_drains(runtime: SessionRuntime) -> None:
+    drain_runtime = SessionRuntime(runtime.ledger, cancel_timeout_s=1.0)
+
     async def program(request, emit, decide):
         await session.stop.wait()
         await emit(TextEvent(run_id=request.run_id, seq=9, text="stopped"))
         return TurnFinished(result=TurnResult(run_id=request.run_id, status="cancelled"))
 
     session = TestSession(program)
-    async with asyncio.timeout(2):
-        outcome, next_seq = await execute(runtime, session, turn_request(timeout_s=0.02))
+    async with asyncio.timeout(3):
+        outcome, next_seq = await execute(drain_runtime, session, turn_request(timeout_s=0.02))
     assert isinstance(outcome, TurnFinished) and outcome.result.status == "cancelled"
     assert session.cancel_calls == ["run"] and next_seq == 1
     assert len(await runtime.ledger.get_run_events("run")) == 1

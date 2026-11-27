@@ -13,6 +13,7 @@ from itertools import count
 from pathlib import Path
 from typing import Any
 
+from john.drivers._common import build_child_env
 from john.transport import (
     Frame,
     JsonRpcError,
@@ -87,7 +88,11 @@ _TURN_NOTICES = {
     "error",
     *_REASONING_DELTAS,
 }
-_AUTH_ERROR = re.compile(r"\b401\b|\bunauthorized\b|\bnot authenticated\b", re.IGNORECASE)
+_AUTH_ERROR = re.compile(
+    r"\b(?:401|unauthorized|not authenticated|authentication failed|invalid_api_key|"
+    r"invalid api key|token (?:has )?expired|login required|requires authentication)\b",
+    re.IGNORECASE,
+)
 
 
 def _object(value: Any) -> Frame:
@@ -170,8 +175,7 @@ class _Turn:
     messages: dict[str, _MessageItem] = field(default_factory=dict)
     terminal_ids: set[str] = field(default_factory=set)
     usage: dict[str, int] | None = None
-    error_code: str | None = None
-    auth_required: bool = False
+    last_error_code: str | None = None
     sent: bool = False
     settled: bool = False
     cancelled: bool = False
@@ -288,12 +292,12 @@ class CodexAppServerSession(DriverSession):
         try:
             response = await self._peer.request(method, params, timeout_s=_RPC_TIMEOUT)
         except JsonRpcError as exc:
+            if exc.code == 401 or _AUTH_ERROR.search(exc.message):
+                raise AuthRequiredError("Codex account authentication is required") from None
             if method == "thread/resume":
                 raise ResumeUnavailableError(
                     f"Codex thread/resume failed (RPC {exc.code})"
                 ) from None
-            if exc.code == 401 or _AUTH_ERROR.search(exc.message):
-                raise AuthRequiredError("Codex account authentication is required") from None
             raise TransportError(f"Codex {method} failed (RPC {exc.code})") from None
         except TimeoutError:
             raise TransportError(f"Codex {method} timed out") from None
@@ -619,8 +623,7 @@ class CodexAppServerSession(DriverSession):
     @staticmethod
     async def _emit_error(active: _Turn, error: Frame, retryable: bool) -> None:
         code, message = _error_details(error)
-        active.error_code = code
-        active.auth_required |= code == AuthRequiredError.code
+        active.last_error_code = code
         await active.emit(ErrorEvent, code=code, message=message, retryable=retryable)
 
     async def _completed(self, active: _Turn, turn: Frame) -> tuple[TurnStatus, str]:
@@ -644,11 +647,9 @@ class CodexAppServerSession(DriverSession):
             )
         if error := _object(turn.get("error")):
             code, _ = _error_details(error)
-            if code != active.error_code:
+            if code != active.last_error_code:
                 await self._emit_error(active, error, False)
-        if active.auth_required:
-            return "failed", AuthRequiredError.code
-        return "failed", active.error_code or "codex_turn_failed"
+        return "failed", active.last_error_code or "codex_turn_failed"
 
 
 def _within_workspace(path: object, workspace: Path) -> bool:
@@ -667,12 +668,11 @@ def _resolve_codex_home(profile: AgentProfile, cwd: Path, env: dict[str, str]) -
         elif configured := env.get("CODEX_HOME"):
             path = cwd / configured
         else:
-            if env.get("HOME") == "":
+            home = env.get("HOME")
+            if not home:
                 import pwd
 
-                home = Path(pwd.getpwuid(os.getuid()).pw_dir)
-            else:
-                home = Path(profile.env["HOME"]) if "HOME" in profile.env else Path.home()
+                home = pwd.getpwuid(os.getuid()).pw_dir
             path = cwd / home / ".codex"
         state_dir = path.resolve()
     except (OSError, RuntimeError, ValueError, ImportError, KeyError):
@@ -738,7 +738,7 @@ class CodexAppServerDriver(Driver):
             raise ResumeUnavailableError("Codex native resume requires a persistent profile")
 
         cwd = (workspace_path or Path.cwd()).resolve()
-        env = os.environ | profile.env
+        env = build_child_env(profile)
         state_dir = _resolve_codex_home(profile, cwd, env)
         if profile.profile_dir is not None or env.get("CODEX_HOME"):
             env["CODEX_HOME"] = str(state_dir)

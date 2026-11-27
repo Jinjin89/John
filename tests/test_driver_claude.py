@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,7 @@ from john.types import (
     AgentProfile,
     ApprovalDecision,
     ApprovalRequest,
+    AuthRequiredError,
     BusyError,
     Capabilities,
     ErrorEvent,
@@ -46,7 +48,7 @@ for line in open(sys.argv[-1], encoding='utf-8'):
 _MOCK = """
 import json, os, sys
 
-mode = sys.argv[-1]
+mode, _, arguments = sys.argv[-1].partition(':')
 flags = ['-p', '--input-format', 'stream-json', '--output-format', 'stream-json',
          '--verbose', '--include-partial-messages', '--permission-prompts', 'host',
          '--permission-prompt-tool', 'stdio', '--permission-mode']
@@ -55,6 +57,10 @@ if mode == 'resume':
     assert sys.argv[-4:] == ['plan', '--resume', 'restored', 'resume']
 else:
     assert sys.argv[-2] == 'manual'
+if mode == 'child_env':
+    assert 'ANTHROPIC_API_KEY' not in os.environ
+    assert os.environ['ANTHROPIC_AUTH_TOKEN'] == 'profile-fixture'
+    assert os.environ['JOHN_CLAUDE_MOCK'] == 'private-launch'
 
 def send(type_, **fields):
     print(json.dumps({'type': type_, **fields}), flush=True)
@@ -81,10 +87,15 @@ if mode == 'timeout':
     sys.stdin.read()
     sys.exit(0)
 send('control_response', response={'request_id': 'different-request', 'subtype': 'error'})
+if mode == 'initialize_error':
+    send('control_response', response={'request_id': 'john-init-1', 'subtype': 'error',
+                                       **json.loads(arguments)})
+    assert not sys.stdin.read()
+    sys.exit(0)
 effective = {'mode_mismatch': 'acceptEdits', 'resume': 'plan'}.get(mode, 'default')
 send('control_response', response={'request_id': 'john-init-1', 'subtype': 'success',
                                    'response': {'current_permission_mode': effective}})
-if mode == 'mode_mismatch':
+if mode in ('mode_mismatch', 'child_env'):
     assert not sys.stdin.read()
     sys.exit(0)
 user = receive('user')
@@ -99,6 +110,25 @@ if mode in ('error', 'auth'):
     send('assistant', is_api_error_message=True, session_id=session,
          message={'content': [{'type': 'text', 'text': error}]})
     result(is_error=True, result=error, api_error_status=401 if mode == 'auth' else 502)
+    sys.exit(0)
+
+if mode == 'auth_diagnostic':
+    assistant, terminal = json.loads(arguments)
+    if assistant is not None:
+        send('assistant', session_id=session, **assistant)
+    result(is_error=True, **terminal)
+    sys.exit(0)
+
+if mode == 'tool_auth_text':
+    message = 'HTTP 401: Authentication failed'
+    send('assistant', session_id=session, message={'content': [
+        {'type': 'text', 'text': message},
+        {'type': 'tool_use', 'id': 'tool-1', 'name': 'Read', 'input': {'error': message}},
+    ]})
+    send('user', session_id=session, message={'role': 'user', 'content': [
+        {'type': 'tool_result', 'tool_use_id': 'tool-1', 'is_error': True, 'content': message},
+    ]})
+    result(is_error=True, result='The turn failed')
     sys.exit(0)
 
 if mode == 'rich':
@@ -192,6 +222,24 @@ def _sink(records: list[RuntimeEvent]):
         records.append(event)
 
     return emit
+
+
+async def test_claude_removes_configured_environment_variables_before_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "parent-key-fixture")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "parent-token-fixture")
+    profile = _profile(tmp_path, _MOCK, "child_env")
+    profile = profile.model_copy(
+        update={
+            "unset_env": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
+            "env": {**profile.env, "ANTHROPIC_AUTH_TOKEN": "profile-fixture"},
+        }
+    )
+    async with ClaudeStreamJsonDriver().open(profile, workspace_path=tmp_path, access="read_only"):
+        pass
+    assert os.environ["ANTHROPIC_API_KEY"] == "parent-key-fixture"
+    assert os.environ["ANTHROPIC_AUTH_TOKEN"] == "parent-token-fixture"
 
 
 @pytest.mark.parametrize("fixture", ["cli.jsonl", "model-reference.jsonl"])
@@ -375,6 +423,138 @@ async def test_claude_result_checks_is_error_on_success_subtype(
         isinstance(event, ErrorEvent) and "diagnostic-secret" not in event.message
         for event in events
     )
+
+
+@pytest.mark.parametrize(
+    ("assistant", "terminal", "reason", "event_code"),
+    [
+        pytest.param(
+            {
+                "is_api_error_message": True,
+                "message": {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Your account can't receive replies from Claude right now. "
+                            "Visit portal.anthropic.com/verify.",
+                        }
+                    ]
+                },
+            },
+            {"api_error_status": 403},
+            "auth_required",
+            "auth_required",
+            id="account-verification",
+        ),
+        pytest.param(
+            {"api_error_status": 401},
+            {},
+            "auth_required",
+            "auth_required",
+            id="assistant-401",
+        ),
+        pytest.param(
+            None,
+            {"api_error_status": 401, "result": "The provider rejected the request"},
+            "auth_required",
+            None,
+            id="result-401",
+        ),
+        pytest.param(
+            {"error": {"type": "invalid_request_error", "code": "invalid_api_key"}},
+            {},
+            "auth_required",
+            "auth_required",
+            id="structured-invalid-key",
+        ),
+        pytest.param(
+            {"error": "authentication_failed"},
+            {},
+            "auth_required",
+            "auth_required",
+            id="sdk-authentication-failed",
+        ),
+        pytest.param(
+            {"error": {"type": "permission_error", "message": "Unauthorized to use this model"}},
+            {"api_error_status": 403, "result": "Unauthorized to use this model"},
+            "Unauthorized to use this model",
+            "api_error",
+            id="permission-denial",
+        ),
+        pytest.param(
+            None,
+            {"api_error_status": 403, "result": "Finish signing in at the verification portal"},
+            "auth_required",
+            None,
+            id="403-with-explicit-verification",
+        ),
+        pytest.param(
+            None,
+            {"result": "API error: HTTP 401"},
+            "auth_required",
+            None,
+            id="text-only-401",
+        ),
+    ],
+)
+async def test_claude_classifies_native_auth_diagnostics(
+    tmp_path: Path,
+    assistant: dict[str, Any] | None,
+    terminal: dict[str, Any],
+    reason: str,
+    event_code: str | None,
+) -> None:
+    profile = _profile(tmp_path, _MOCK, "auth_diagnostic:" + json.dumps([assistant, terminal]))
+    events: list[RuntimeEvent] = []
+    async with ClaudeStreamJsonDriver().open(
+        profile, workspace_path=tmp_path, access="read_only"
+    ) as session:
+        result = await session.run_turn(
+            TurnRequest(run_id="auth", prompt="Run"), _sink(events), deny_all
+        )
+    assert (result.result.status, result.result.reason) == ("failed", reason)
+    assert [event.code for event in events if isinstance(event, ErrorEvent)] == (
+        [event_code] if event_code else []
+    )
+
+
+@pytest.mark.parametrize(
+    ("diagnostic", "exception"),
+    [
+        ({"api_error_status": 401, "error": "Provider rejected the request"}, AuthRequiredError),
+        (
+            {"error": {"type": "authentication_error", "message": "Login unavailable"}},
+            AuthRequiredError,
+        ),
+        ({"api_error_status": 403, "error": "Unauthorized to use this model"}, TransportError),
+    ],
+)
+async def test_claude_classifies_initialize_errors(
+    tmp_path: Path, diagnostic: dict[str, Any], exception: type[Exception]
+) -> None:
+    profile = _profile(tmp_path, _MOCK, "initialize_error:" + json.dumps(diagnostic))
+    with pytest.raises(exception):
+        async with ClaudeStreamJsonDriver().open(
+            profile, workspace_path=tmp_path, access="read_only"
+        ):
+            pytest.fail("Opened a session after an initialization error")
+
+
+async def test_claude_does_not_classify_auth_text_in_model_or_tool_payloads(tmp_path: Path) -> None:
+    profile = _profile(tmp_path, _MOCK, "tool_auth_text")
+    events: list[RuntimeEvent] = []
+    async with ClaudeStreamJsonDriver().open(
+        profile, workspace_path=tmp_path, access="read_only"
+    ) as session:
+        result = await session.run_turn(
+            TurnRequest(run_id="tool-error", prompt="Run"), _sink(events), deny_all
+        )
+    assert (result.result.status, result.result.reason) == ("failed", "The turn failed")
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert [event.phase for event in events if isinstance(event, ToolEvent)] == [
+        "started",
+        "failed",
+    ]
 
 
 @pytest.mark.parametrize("mode", ["cancel", "deny_cancel"])

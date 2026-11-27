@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import os
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from copy import deepcopy
@@ -22,6 +22,7 @@ from john.drivers._common import (
     _string,
     _Turn,
     _turn_prompt,
+    build_child_env,
 )
 from john.transport import Frame, FrameQueue, StdioTransport, redact_text
 from john.types import (
@@ -65,22 +66,52 @@ _STDIO_FLAGS = (
     "stdio",
 )
 _CANCELLED = {"aborted_streaming", "aborted_tools", "cancelled", "canceled", "interrupted"}
+_AUTH_ERROR_TYPES = {"authentication_error", "authentication_failed", "invalid_api_key"}
+_UNAUTHORIZED_TEXT = re.compile(r"\b(?:401|unauthorized)\b")
+_FORBIDDEN_TEXT = re.compile(r"\b(?:403|permission_error)\b")
 
 
-def _auth_required(message: str) -> bool:
-    message = message.casefold()
+def _auth_required(message: str, *, permission_denied: bool = False) -> bool:
+    message = message.casefold().replace("’", "'")
     return any(
         phrase in message
         for phrase in (
             "authentication required",
-            "unauthorized",
+            "authentication_error",
+            "authentication failed",
             "invalid api key",
+            "invalid_api_key",
             "not logged in",
             "please run /login",
             "oauth token has expired",
             "invalid authentication",
+            "your account can't receive replies",
+            "verification portal",
         )
+    ) or (
+        not permission_denied
+        and _FORBIDDEN_TEXT.search(message) is None
+        and _UNAUTHORIZED_TEXT.search(message) is not None
     )
+
+
+def _error_details(frame: Frame, message: str = "") -> tuple[str, str]:
+    raw_error = frame.get("error")
+    error = _object(raw_error)
+    error_type = _string(error.get("type")) or _string(raw_error)
+    error_code = _string(error.get("code"))
+    error_message = _string(error.get("message")) or _string(raw_error)
+    status = frame.get("api_error_status")
+    permission_denied = status == 403 or "permission_error" in (error_type, error_code)
+    auth = (
+        status == 401
+        or error_type in _AUTH_ERROR_TYPES
+        or error_code in _AUTH_ERROR_TYPES
+        or _auth_required(message, permission_denied=permission_denied)
+        or _auth_required(error_message, permission_denied=permission_denied)
+    )
+    code = AuthRequiredError.code if auth else "api_error"
+    return code, redact_text(message or error_message or error_type or error_code)
 
 
 @dataclass(slots=True)
@@ -125,7 +156,7 @@ class _ClaudeTurn(_Turn):
     tools: dict[str, _Tool] = field(default_factory=dict)
     seen_snapshots: set[str] = field(default_factory=set)
     started: bool = False
-    api_error: str = ""
+    api_error: tuple[str, str] | None = None
 
     def new_message(self, parent: str, message_id: str = "") -> _Message:
         message = self.live[parent] = _Message(message_id)
@@ -211,7 +242,7 @@ class ClaudeStreamJsonSession:
             if effective and effective != mode and {effective, mode} != {"manual", "default"}:
                 raise UnsupportedError("Claude initialized with a different permission mode")
             return
-        if response is not None and _auth_required(_string(response.get("error"))):
+        if response is not None and _error_details(response)[0] == AuthRequiredError.code:
             raise AuthRequiredError("Claude requires authentication")
         if resume_ref is not None:
             raise ResumeUnavailableError("Claude exited or rejected initialization during resume")
@@ -479,18 +510,24 @@ class ClaudeStreamJsonSession:
     async def _assistant(self, turn: _ClaudeTurn, frame: Frame) -> None:
         message = _object(frame.get("message"))
         content = message.get("content")
-        if frame.get("is_api_error_message") is True:
-            errors = (
-                [_string(_object(item).get("text")) for item in content]
+        if (
+            frame.get("is_api_error_message") is True
+            or frame.get("error")
+            or frame.get("api_error_status") is not None
+        ):
+            detail = (
+                " ".join(
+                    _string(item.get("text"))
+                    for item in content
+                    if isinstance(item, dict) and item.get("type") == "text"
+                ).strip()
                 if isinstance(content, list)
-                else []
+                else ""
             )
-            turn.api_error = redact_text(" ".join(filter(None, errors))) or "Claude API error"
-            await turn.emit(
-                ErrorEvent,
-                code="auth_required" if _auth_required(turn.api_error) else "api_error",
-                message=turn.api_error,
-            )
+            code, detail = _error_details(frame, detail)
+            detail = detail or "Claude API error"
+            turn.api_error = (code, detail)
+            await turn.emit(ErrorEvent, code=code, message=detail)
             return
         if not isinstance(content, list):
             await turn.other("assistant", frame)
@@ -563,13 +600,20 @@ class ClaudeStreamJsonSession:
                 if isinstance(errors, list)
                 else ""
             )
-            detail = details or _string(frame.get("result")) or turn.api_error
-            if frame.get("api_error_status") in (401, 403) or _auth_required(detail):
-                reason = "auth_required"
-            else:
-                reason = redact_text(
-                    detail or terminal or (subtype if subtype != "success" else "api_error")
-                )
+            code, detail = _error_details(frame, details or _string(frame.get("result")))
+            if turn.api_error and not detail and code == "api_error":
+                earlier_code, earlier_detail = turn.api_error
+                http_status = frame.get("api_error_status")
+                if http_status is None:
+                    code, detail = earlier_code, earlier_detail
+                elif http_status == 403 and _auth_required(earlier_detail, permission_denied=True):
+                    code = AuthRequiredError.code
+            reason = (
+                code
+                if code == AuthRequiredError.code
+                else detail
+                or redact_text(terminal or (subtype if subtype != "success" else "api_error"))
+            )
         else:
             raise TransportError("Claude returned an unrecognized terminal result")
         usage = _safe_payload(_object(frame.get("usage")))
@@ -634,7 +678,7 @@ class ClaudeStreamJsonDriver:
                 *profile.args,
             ),
             cwd=workspace_path,
-            env={**os.environ, **profile.env},
+            env=build_child_env(profile),
             on_frame=session._on_frame,
             on_eof=session._on_eof,
         )

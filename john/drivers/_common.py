@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import os
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -27,6 +28,15 @@ from john.types import (
     WorkspaceAccess,
     WorkspaceViolationError,
 )
+
+
+def build_child_env(profile: AgentProfile) -> dict[str, str]:
+    """Apply profile removals and overrides to an independent child environment."""
+    env = dict(os.environ)
+    for key in profile.unset_env:
+        env.pop(key, None)
+    env.update(profile.env)
+    return env
 
 
 def _object(value: Any) -> Frame:

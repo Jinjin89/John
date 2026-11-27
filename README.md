@@ -42,6 +42,11 @@ john/
 - **Tool approvals ≠ `INPUT_REQUIRED`:** Mid-turn tool permissions are resolved inside the bridge by local async policy (deny by default); genuine task-level clarifications use A2A `TASK_STATE_INPUT_REQUIRED` and resume cleanly via `reply()`.
 - **Fail-closed defaults:** `Capabilities.enforced_sandbox` defaults to empty, `john serve` refuses unauthenticated non-loopback binds, and core modules contain zero backend-specific branching (enforced in `tests/test_arch_invariants.py`).
 
+## Documentation
+
+- [Use Claude Code and Codex together](docs/quickstart-claude-codex.md)
+- [Authentication inheritance and automatic auth fallback](docs/auth-and-fallback.md)
+
 ## Quick Start
 
 ### 1. Install (Python 3.12 + `uv`)
@@ -94,6 +99,7 @@ import asyncio
 from a2a.types import TaskState
 from john import John, OutputSpec, Workspace
 
+
 async def main() -> None:
     async with John.open("agents.toml") as j:
         # Step 1: Generalist produces a declared workspace artifact
@@ -118,6 +124,7 @@ async def main() -> None:
         if qc.status.state == TaskState.TASK_STATE_INPUT_REQUIRED:
             qc = await j.reply("qc", qc, "0.80")
         print(TaskState.Name(qc.status.state), qc.artifacts)
+
 
 asyncio.run(main())
 ```

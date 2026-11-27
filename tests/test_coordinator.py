@@ -28,6 +28,7 @@ from john import (
     LIFECYCLE_EXT_URI,
     WORKSPACE_EXT_URI,
     AgentProfile,
+    AuthRequiredError,
     BusyError,
     Capabilities,
     DuplicateMessageConflictError,
@@ -85,8 +86,9 @@ class FixtureSession:
 
 
 class FixtureDriver:
-    def __init__(self, program: Program):
+    def __init__(self, program: Program, *, auth_failures_on_open: frozenset[str] = frozenset()):
         self.program = program
+        self.auth_failures_on_open = auth_failures_on_open
         self.requests: list[tuple[str, TurnRequest]] = []
         self.opened: list[tuple[str, Path | None, WorkspaceAccess, str | None]] = []
 
@@ -100,6 +102,8 @@ class FixtureDriver:
         resume_ref: str | None = None,
     ) -> AsyncIterator[FixtureSession]:
         self.opened.append((profile.name, workspace_path, access, resume_ref))
+        if profile.name in self.auth_failures_on_open:
+            raise AuthRequiredError("Private native login details")
         yield FixtureSession(self, profile, workspace_path, resume_ref)
 
 
@@ -371,6 +375,195 @@ async def test_concurrent_and_persisted_retries_use_the_reserved_id(tmp_path: Pa
     assert len(driver.requests) == 1
 
 
+async def test_open_auth_fallback_replays_one_task_across_restart(tmp_path: Path) -> None:
+    path = tmp_path / "ledger.db"
+    profiles = [
+        profile(fallback_agents=("first", "second", "ready")),
+        profile("first", fallback_agents=("second",)),
+        profile("second"),
+        AgentProfile(name="ready", kind="alternate"),
+    ]
+    primary = FixtureDriver(echo, auth_failures_on_open=frozenset({"worker", "first", "second"}))
+    fallback = FixtureDriver(echo)
+    drivers = {"fixture": primary, "alternate": fallback}
+    ledger = await SqliteLedger.open(path)
+    async with John(profiles=profiles, workspaces=(), ledger=ledger, drivers=drivers) as john:
+        task = await john.assign("worker", "sample", message_id="fallback")
+        assert task.status.state == COMPLETED and task.artifacts[0].parts[0].text == "sample"
+        assert MessageToDict(task.metadata) == {
+            LIFECYCLE_EXT_URI: {"fallback_from": "worker", "resolved_agent": "ready"}
+        }
+        assert await john.get("worker", task.id) == task
+        with pytest.raises(TaskNotFoundError):
+            await john.get("ready", task.id)
+        assert await john.assign("worker", "sample", message_id="fallback") == task
+        with pytest.raises(DuplicateMessageConflictError):
+            await john.assign("worker", "different", message_id="fallback")
+        runs = await ledger.list_runs(task_id=task.id)
+        assert [run["status"] for run in runs] == ["failed", "failed", "failed", "completed"]
+        assert [run["parent_run_id"] for run in runs] == [
+            None,
+            *[run["run_id"] for run in runs[:-1]],
+        ]
+        assert all(run["context_id"] == task.context_id for run in runs)
+        with closing(sqlite3.connect(path)) as sql:
+            assert sql.execute(
+                "SELECT task_id, context_id, agent_name FROM a2a_tasks"
+            ).fetchall() == [(task.id, task.context_id, "worker")]
+            assert sql.execute(
+                "SELECT task_id, message_id, agent_name FROM message_reservations"
+            ).fetchall() == [(task.id, "fallback", "worker")]
+
+    ledger = await SqliteLedger.open(path)
+    async with John(profiles=profiles, workspaces=(), ledger=ledger, drivers=drivers) as john:
+        assert await john.assign("worker", "sample", message_id="fallback") == task
+    assert [name for name, *_ in primary.opened] == ["worker", "first", "second"]
+    assert not primary.requests and [name for name, _ in fallback.requests] == ["ready"]
+
+
+@pytest.mark.parametrize("resume_auth_required", [False, True])
+async def test_reply_resumes_exact_fallback_profile_after_restart(
+    tmp_path: Path,
+    resume_auth_required: bool,
+) -> None:
+    config = tmp_path / "agents.toml"
+    config.write_text(
+        """
+[agents.worker]
+kind = "fixture"
+fallback_agents = ["backup"]
+
+[agents.backup]
+kind = "alternate"
+fallback_agents = ["spare"]
+
+[agents.backup.capabilities]
+task_questions = true
+resume = true
+
+[agents.spare]
+kind = "fixture"
+""",
+        encoding="utf-8",
+    )
+    continuation = {"phase": "question", "__john_executor_agent__": "native data"}
+
+    async def ask(session: FixtureSession, request: TurnRequest) -> TurnOutcome:
+        assert session.profile.name == "backup"
+        if request.continuation is None:
+            return TurnNeedsInput(
+                run_id=request.run_id,
+                question="Which cutoff?",
+                continuation=continuation,
+                native_session_ref="backup-session",
+            )
+        assert session.resume_ref == "backup-session"
+        assert request.continuation == continuation
+        return finish(request, text=f"accepted {request.prompt}")
+
+    primary = FixtureDriver(echo, auth_failures_on_open=frozenset({"worker"}))
+    backup = FixtureDriver(ask)
+    drivers = {"fixture": primary, "alternate": backup}
+    resolution = {"fallback_from": "worker", "resolved_agent": "backup"}
+    async with John.open(config, drivers=drivers) as john:
+        parked = await john.assign("worker", "ask", message_id="initial")
+        assert (
+            parked.status.state == INPUT_REQUIRED
+            and parked.status.message.parts[0].text == "Which cutoff?"
+        )
+        assert MessageToDict(parked.metadata)[LIFECYCLE_EXT_URI] == resolution
+        assert await john.get("worker", parked.id) == parked
+        checkpoint = await john.ledger.peek_continuation(
+            "local", "worker", parked.id, parked.context_id
+        )
+        assert (
+            checkpoint is not None
+            and checkpoint["continuation"]["__john_executor_agent__"] == "backup"
+        )
+
+    if resume_auth_required:
+        backup.auth_failures_on_open = frozenset({"backup"})
+    async with John.open(config, drivers=drivers) as john:
+        task = await john.reply("worker", parked, "5", message_id="answer")
+        assert (task.id, task.context_id) == (parked.id, parked.context_id)
+        assert await john.get("worker", task.id) == task
+        assert await john.reply("worker", parked, "5", message_id="answer") == task
+        if resume_auth_required:
+            assert (
+                task.status.state == FAILED and task.status.message.parts[0].text == "auth_required"
+            )
+            assert MessageToDict(task.metadata)[LIFECYCLE_EXT_URI] == resolution | {
+                "auth_required": True
+            }
+        else:
+            assert (
+                task.status.state == COMPLETED and task.artifacts[0].parts[0].text == "accepted 5"
+            )
+            assert MessageToDict(task.metadata)[LIFECYCLE_EXT_URI] == resolution
+            _, paused_run, resumed = await john.ledger.list_runs(task_id=task.id)
+            assert resumed["parent_run_id"] == paused_run["run_id"]
+    assert [name for name, *_ in primary.opened] == ["worker"]
+    assert backup.opened == [
+        ("backup", None, "read_only", None),
+        ("backup", None, "read_only", "backup-session"),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("profiles", "error", "match"),
+    [
+        pytest.param(
+            [profile(fallback_agents=("missing",))],
+            ValueError,
+            "Unknown fallback agent",
+            id="unknown",
+        ),
+        pytest.param(
+            [profile(fallback_agents=("worker",))], ValueError, "Fallback agent cycle", id="self"
+        ),
+        pytest.param(
+            [profile(fallback_agents=("backup",)), profile("backup", fallback_agents=("worker",))],
+            ValueError,
+            "Fallback agent cycle",
+            id="cycle",
+        ),
+        pytest.param(
+            [
+                profile(fallback_agents=("peer",)),
+                AgentProfile(name="peer", kind="remote", url="http://127.0.0.1/a2a"),
+            ],
+            UnsupportedError,
+            "Fallback agents must be local profiles",
+            id="remote-target",
+        ),
+        pytest.param(
+            [
+                profile(f"agent-{number}", fallback_agents=(f"agent-{number + 1}",))
+                for number in range(6)
+            ]
+            + [profile("agent-6")],
+            ValueError,
+            "at most 5 levels",
+            id="depth",
+        ),
+    ],
+)
+async def test_invalid_fallback_configuration_is_rejected(
+    tmp_path: Path,
+    profiles: list[AgentProfile],
+    error: type[Exception],
+    match: str,
+) -> None:
+    ledger = await SqliteLedger.open(tmp_path / "ledger.db")
+    driver = FixtureDriver(echo)
+    try:
+        with pytest.raises(error, match=match):
+            make_john(ledger, driver, profiles=profiles)
+        assert not driver.opened
+    finally:
+        await ledger.close()
+
+
 async def test_retry_can_join_dispatch_after_cancelled_reservation_wait(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -579,6 +772,60 @@ async def loopback(john: John, agent: str) -> AsyncIterator[str]:
         finally:
             server.should_exit = True
             await asyncio.wait_for(serving, 5)
+
+
+@pytest.mark.parametrize("first_streams", [False, True])
+async def test_real_loopback_fallback_reuses_the_public_task_for_get_and_retry(
+    tmp_path: Path,
+    first_streams: bool,
+) -> None:
+    ledger = await SqliteLedger.open(tmp_path / "ledger.db")
+    driver = FixtureDriver(echo, auth_failures_on_open=frozenset({"worker"}))
+    profiles = [profile(fallback_agents=("backup",)), profile("backup")]
+    async with loopback(make_john(ledger, driver, profiles=profiles), "worker") as url:
+        async with httpx.AsyncClient(
+            base_url=httpx.URL(url).copy_with(path="/"),
+            headers={VERSION_HEADER: PROTOCOL_VERSION_1_0},
+            timeout=15,
+        ) as client:
+            initial = await send_rpc(client, wire_message("fallback"), stream=first_streams)
+            task_id = initial[0]["result"]["task"]["id"]
+            public_context = initial[0]["result"]["task"]["contextId"]
+            response = await client.post(
+                "/rpc",
+                json={
+                    "jsonrpc": "2.0",
+                    "id": "get",
+                    "method": "GetTask",
+                    "params": {"id": task_id},
+                },
+            )
+            assert response.status_code == 200
+            task = response.json()["result"]
+            assert task["id"] == task_id and task["contextId"] == public_context
+            assert task["status"]["state"] == "TASK_STATE_COMPLETED"
+            resolution = {"fallback_from": "worker", "resolved_agent": "backup"}
+            assert task["metadata"][LIFECYCLE_EXT_URI] == resolution
+            if first_streams:
+                statuses = [
+                    item["result"]["statusUpdate"]
+                    for item in initial
+                    if "statusUpdate" in item["result"]
+                ]
+                assert [status["status"]["state"] for status in statuses] == [
+                    "TASK_STATE_WORKING",
+                    "TASK_STATE_COMPLETED",
+                ]
+                assert all(status["taskId"] == task_id for status in statuses)
+                assert statuses[-1]["metadata"][LIFECYCLE_EXT_URI] == resolution
+            (replay,) = await send_rpc(client, wire_message("fallback"), stream=not first_streams)
+            assert replay["result"]["task"] == task
+        assert [run["status"] for run in await ledger.list_runs(task_id=task_id)] == [
+            "failed",
+            "completed",
+        ]
+    assert [name for name, *_ in driver.opened] == ["worker", "backup"]
+    assert [name for name, _ in driver.requests] == ["backup"]
 
 
 async def test_remote_a2a_assign_reply_get_and_cancel_over_real_loopback(tmp_path: Path) -> None:
